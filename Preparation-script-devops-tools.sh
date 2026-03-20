@@ -1,273 +1,290 @@
 #!/bin/bash
-# Script d'installation pour Docker, Kubernetes et outils associés avec gestion d'erreurs améliorée
+# =============================================================================
+# Script d'installation — Projet DevOps CI/CD (EFREI ARIR86)
+# Version corrigée — Mars 2026
+#
+# Installe : Docker, Docker Compose (plugin), kubectl, Minikube, Helm, Git
+# Optionnel : ArgoCD CLI
+#
+# Usage : chmod +x install-devops-tools.sh && ./install-devops-tools.sh
+# NE PAS exécuter en root (sudo) — le script demande sudo quand nécessaire
+# =============================================================================
 
-# Couleurs pour les messages
+set -euo pipefail
+
+# Couleurs
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-# Fonction pour vérifier la connexion internet
-check_internet() {
-    echo -e "${YELLOW}Vérification de la connexion internet...${NC}"
-    if ! ping -c 1 google.com &> /dev/null; then
-        echo -e "${RED}Erreur: Pas de connexion internet ou problèmes DNS${NC}"
-        echo "Veuillez vérifier:"
-        echo "1. Votre connexion réseau"
-        echo "2. Les paramètres DNS (/etc/resolv.conf)"
-        echo "3. Le service systemd-resolved (sudo systemctl restart systemd-resolved)"
+# -----------------------------------------------------------------------------
+# Fonctions utilitaires
+# -----------------------------------------------------------------------------
+
+log_info()    { echo -e "${GREEN}[✓]${NC} $*"; }
+log_warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
+log_error()   { echo -e "${RED}[✗]${NC} $*"; }
+log_step()    { echo -e "\n${BLUE}━━━ $* ━━━${NC}"; }
+
+# Vérifie qu'on n'est PAS root (Minikube et Docker refusent root)
+check_not_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        log_error "Ce script ne doit PAS être exécuté en tant que root/sudo."
+        echo "    Lancez-le avec votre utilisateur normal :"
+        echo "    ./install-devops-tools.sh"
         exit 1
     fi
 }
 
-# Fonction pour vérifier et installer les paquets
-install_package() {
-    local pkg=$1
-    echo -e "${YELLOW}Vérification de $pkg...${NC}"
-    if ! dpkg -l | grep -q " $pkg "; then
-        echo -e "${YELLOW}Installation de $pkg...${NC}"
-        sudo apt install -y $pkg || {
-            echo -e "${RED}Échec de l'installation de $pkg${NC}"
-            exit 1
-        }
-    else
-        echo -e "${GREEN}$pkg est déjà installé${NC}"
+check_internet() {
+    log_step "Vérification de la connexion internet"
+    if ! ping -c 1 -W 5 google.com &>/dev/null; then
+        log_error "Pas de connexion internet ou problème DNS."
+        echo "  1. Vérifiez votre connexion réseau"
+        echo "  2. Vérifiez /etc/resolv.conf"
+        echo "  3. Essayez : sudo systemctl restart systemd-resolved"
+        exit 1
     fi
+    log_info "Connexion internet OK"
 }
 
-# -------------------------------------------------------------------
-# Début de l'installation
-# -------------------------------------------------------------------
-clear
-echo -e "${GREEN}Début de l'installation des outils Docker et Kubernetes...${NC}"
+# Détecte l'architecture (amd64 ou arm64)
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  echo "amd64" ;;
+        aarch64) echo "arm64" ;;
+        *)
+            log_error "Architecture non supportée : $arch"
+            exit 1
+            ;;
+    esac
+}
 
-# 1. Vérification des prérequis
+ARCH=$(detect_arch 2>/dev/null || echo "amd64")
+
+# -----------------------------------------------------------------------------
+# Vérifications préalables
+# -----------------------------------------------------------------------------
+
+check_not_root
 check_internet
 
-# 2. Mise à jour du système
-echo -e "${YELLOW}Mise à jour du système...${NC}"
-sudo apt update -y && sudo apt upgrade -y || {
-    echo -e "${RED}Échec de la mise à jour du système${NC}"
+# Détection OS
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VERSION="${VERSION_CODENAME:-$(lsb_release -cs 2>/dev/null || echo 'unknown')}"
+else
+    log_error "Impossible de détecter l'OS. Ce script supporte Ubuntu/Debian."
     exit 1
-}
+fi
 
-# 3. Installation des dépendances
-echo -e "${YELLOW}Installation des dépendances...${NC}"
-DEPENDENCIES=(
-    curl
-    wget
-    git
-    apt-transport-https
-    ca-certificates
-    gnupg
-    software-properties-common
-    make
-    lsb-release
-)
+log_info "OS détecté : $OS_ID $OS_VERSION ($ARCH)"
 
-for pkg in "${DEPENDENCIES[@]}"; do
-    install_package $pkg
-done
+if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
+    log_warn "Ce script est conçu pour Ubuntu/Debian. Sur $OS_ID, certaines commandes peuvent échouer."
+fi
 
-# -------------------------------------------------------------------
-# Installation de Docker
-# -------------------------------------------------------------------
-echo -e "${YELLOW}Vérification de Docker...${NC}"
-if ! command -v docker &> /dev/null; then
-    echo -e "${YELLOW}Installation de Docker...${NC}"
-    
-    # Ajout du dépôt Docker
+# =============================================================================
+# 1. Mise à jour du système + dépendances
+# =============================================================================
+log_step "Mise à jour du système et installation des dépendances"
+
+sudo apt-get update -y
+sudo apt-get install -y \
+    curl \
+    wget \
+    git \
+    apt-transport-https \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    make \
+    jq
+
+log_info "Dépendances installées"
+
+# =============================================================================
+# 2. Docker Engine + Docker Compose Plugin
+# =============================================================================
+log_step "Docker Engine + Docker Compose"
+
+if command -v docker &>/dev/null; then
+    log_info "Docker déjà installé : $(docker --version)"
+else
+    log_warn "Installation de Docker..."
+
+    # Nettoyage d'anciennes versions
+    sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+
+    # Clé GPG Docker
     sudo install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg || {
-        echo -e "${RED}Échec de l'import de la clé Docker${NC}"
-        exit 1
-    }
-    
+    curl -fsSL "https://download.docker.com/linux/$OS_ID/gpg" \
+        | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+    # Dépôt Docker
     echo \
-    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-    
-    sudo apt update -y
-    sudo apt install -y docker-ce docker-ce-cli containerd.io || {
-        echo -e "${RED}Échec de l'installation de Docker${NC}"
-        exit 1
-    }
-    
-    # Configuration des permissions Docker
-    echo -e "${YELLOW}Configuration des permissions Docker...${NC}"
-    sudo usermod -aG docker $USER || {
-        echo -e "${RED}Échec de l'ajout de l'utilisateur au groupe docker${NC}"
-        exit 1
-    }
-    
-    # Test de l'installation Docker
-    docker run hello-world && echo -e "${GREEN}Docker installé avec succès${NC}" || {
-        echo -e "${RED}Échec de la vérification de Docker${NC}"
-        exit 1
-    }
-else
-    echo -e "${GREEN}Docker est déjà installé${NC}"
+        "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS_ID \
+        $OS_VERSION stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    sudo apt-get update -y
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    log_info "Docker installé : $(docker --version)"
 fi
 
-# -------------------------------------------------------------------
-# Installation de Docker Compose
-# -------------------------------------------------------------------
-echo -e "${YELLOW}Vérification de Docker Compose...${NC}"
-if ! command -v docker-compose &> /dev/null; then
-    echo -e "${YELLOW}Installation de Docker Compose...${NC}"
-    sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
-    -o /usr/local/bin/docker-compose || {
-        echo -e "${RED}Échec du téléchargement de Docker Compose${NC}"
-        exit 1
-    }
+# Ajout au groupe docker (si pas déjà dedans)
+if ! groups "$USER" | grep -q '\bdocker\b'; then
+    sudo usermod -aG docker "$USER"
+    log_warn "Utilisateur $USER ajouté au groupe docker."
+    log_warn "⚠️  Vous DEVEZ vous déconnecter/reconnecter OU exécuter 'newgrp docker' après ce script."
+    NEED_RELOGIN=true
+else
+    log_info "Utilisateur $USER déjà dans le groupe docker"
+    NEED_RELOGIN=false
+fi
+
+# Vérifier que docker-compose (plugin) fonctionne
+# Note : on utilise "docker compose" (plugin, avec espace) pas "docker-compose" (ancien binaire standalone)
+if docker compose version &>/dev/null; then
+    log_info "Docker Compose plugin : $(docker compose version --short 2>/dev/null || docker compose version)"
+else
+    # Fallback : installer le binaire standalone si le plugin ne marche pas
+    log_warn "Docker Compose plugin non détecté, installation du binaire standalone..."
+    sudo curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+        -o /usr/local/bin/docker-compose
     sudo chmod +x /usr/local/bin/docker-compose
-    
-    # Vérification de l'installation
-    docker-compose --version && echo -e "${GREEN}Docker Compose installé avec succès${NC}" || {
-        echo -e "${RED}Échec de l'installation de Docker Compose${NC}"
-        exit 1
-    }
-else
-    echo -e "${GREEN}Docker Compose est déjà installé${NC}"
+    log_info "Docker Compose standalone : $(docker-compose --version)"
 fi
 
-# -------------------------------------------------------------------
-# Installation de kubectl
-# -------------------------------------------------------------------
-echo -e "${YELLOW}Vérification de kubectl...${NC}"
-if ! command -v kubectl &> /dev/null; then
-    echo -e "${YELLOW}Installation de kubectl...${NC}"
-    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" || {
-        echo -e "${RED}Échec du téléchargement de kubectl${NC}"
-        exit 1
-    }
+# vm.max_map_count pour Elasticsearch / SonarQube
+log_step "Configuration sysctl (vm.max_map_count)"
+CURRENT_MAP_COUNT=$(sysctl -n vm.max_map_count 2>/dev/null || echo "0")
+if [ "$CURRENT_MAP_COUNT" -lt 262144 ]; then
+    sudo sysctl -w vm.max_map_count=262144
+    if ! grep -q "vm.max_map_count" /etc/sysctl.conf; then
+        echo "vm.max_map_count=262144" | sudo tee -a /etc/sysctl.conf > /dev/null
+    fi
+    log_info "vm.max_map_count configuré à 262144 (nécessaire pour Elasticsearch/SonarQube)"
+else
+    log_info "vm.max_map_count déjà ≥ 262144"
+fi
+
+# =============================================================================
+# 3. kubectl
+# =============================================================================
+log_step "kubectl"
+
+if command -v kubectl &>/dev/null; then
+    log_info "kubectl déjà installé : $(kubectl version --client 2>/dev/null | head -1)"
+else
+    log_warn "Installation de kubectl..."
+    KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+    curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
     sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-    rm kubectl
-    
-    # Vérification de l'installation
-    kubectl version --client --short && echo -e "${GREEN}kubectl installé avec succès${NC}" || {
-        echo -e "${RED}Échec de l'installation de kubectl${NC}"
-        exit 1
-    }
-else
-    echo -e "${GREEN}kubectl est déjà installé${NC}"
+    rm -f kubectl
+    log_info "kubectl installé : $(kubectl version --client 2>/dev/null | head -1)"
 fi
 
-# -------------------------------------------------------------------
-# Installation de Minikube
-# -------------------------------------------------------------------
-echo -e "${YELLOW}Vérification de Minikube...${NC}"
-if ! command -v minikube &> /dev/null; then
-    echo -e "${YELLOW}Installation de Minikube...${NC}"
-    curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 || {
-        echo -e "${RED}Échec du téléchargement de Minikube${NC}"
-        exit 1
-    }
-    sudo install minikube-linux-amd64 /usr/local/bin/minikube
-    rm minikube-linux-amd64
-    
-    # Démarrer Minikube
-    echo -e "${YELLOW}Démarrage de Minikube...${NC}"
-    if [ "$(id -u)" -eq 0 ]; then
-        echo -e "${RED}Attention : Minikube ne peut pas être démarré en tant que root${NC}"
-        echo -e "${YELLOW}Utilisez un utilisateur normal avec la commande suivante :${NC}"
-        echo "  minikube start --driver=docker"
+# =============================================================================
+# 4. Minikube (INSTALLATION UNIQUEMENT — on ne le démarre PAS ici)
+# =============================================================================
+log_step "Minikube"
+
+if command -v minikube &>/dev/null; then
+    log_info "Minikube déjà installé : $(minikube version --short 2>/dev/null)"
+else
+    log_warn "Installation de Minikube..."
+    curl -fsSLO "https://storage.googleapis.com/minikube/releases/latest/minikube-linux-${ARCH}"
+    sudo install "minikube-linux-${ARCH}" /usr/local/bin/minikube
+    rm -f "minikube-linux-${ARCH}"
+    log_info "Minikube installé : $(minikube version --short 2>/dev/null)"
+fi
+
+# ⚠️ On ne démarre PAS Minikube ici.
+# Le démarrage avec les bonnes ressources se fait pendant la partie CD du projet :
+#   minikube start --driver=docker --cpus 4 --memory 10240
+log_warn "Minikube n'est PAS démarré. Lancez-le manuellement quand vous en aurez besoin :"
+echo "    minikube start --driver=docker --cpus 4 --memory 10240"
+
+# =============================================================================
+# 5. Helm
+# =============================================================================
+log_step "Helm"
+
+if command -v helm &>/dev/null; then
+    log_info "Helm déjà installé : $(helm version --short 2>/dev/null)"
+else
+    log_warn "Installation de Helm..."
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    log_info "Helm installé : $(helm version --short 2>/dev/null)"
+fi
+
+# =============================================================================
+# 6. ArgoCD CLI (optionnel)
+# =============================================================================
+log_step "ArgoCD CLI (optionnel)"
+
+if command -v argocd &>/dev/null; then
+    log_info "ArgoCD CLI déjà installé : $(argocd version --client --short 2>/dev/null)"
+else
+    echo ""
+    read -r -p "Installer ArgoCD CLI ? (recommandé mais optionnel) [y/N] " REPLY
+    if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+        log_warn "Installation d'ArgoCD CLI..."
+        curl -fsSL -o argocd "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-${ARCH}"
+        sudo install -m 555 argocd /usr/local/bin/argocd
+        rm -f argocd
+        log_info "ArgoCD CLI installé : $(argocd version --client --short 2>/dev/null)"
     else
-        # Vérifier que l'utilisateur est dans le groupe docker
-        if ! groups $USER | grep -q '\bdocker\b'; then
-            echo -e "${RED}L'utilisateur doit être dans le groupe docker pour utiliser Minikube${NC}"
-            echo "Exécutez la commande suivante puis reconnectez-vous :"
-            echo "  sudo usermod -aG docker $USER"
-            exit 1
-        fi
-        
-        minikube start --driver=docker || {
-            echo -e "${RED}Échec du démarrage de Minikube${NC}"
-            echo -e "${YELLOW}Solutions alternatives :${NC}"
-            echo "1. Essayez avec un autre driver : minikube start --driver=podman"
-            echo "2. Ou installez un driver comme kvm2 : https://minikube.sigs.k8s.io/docs/drivers/"
-            exit 1
-        }
-        echo -e "${GREEN}Minikube démarré avec succès${NC}"
-    fi
-else
-    echo -e "${GREEN}Minikube est déjà installé${NC}"
-fi
-
-# -------------------------------------------------------------------
-# Installation de Helm
-# -------------------------------------------------------------------
-echo -e "${YELLOW}Vérification de Helm...${NC}"
-if ! command -v helm &> /dev/null; then
-    echo -e "${YELLOW}Installation de Helm...${NC}"
-    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash || {
-        echo -e "${RED}Échec de l'installation de Helm${NC}"
-        exit 1
-    }
-    
-    # Vérification de l'installation
-    helm version --short && echo -e "${GREEN}Helm installé avec succès${NC}" || {
-        echo -e "${RED}Échec de l'installation de Helm${NC}"
-        exit 1
-    }
-else
-    echo -e "${GREEN}Helm est déjà installé${NC}"
-fi
-
-# -------------------------------------------------------------------
-# Installation optionnelle d'ArgoCD CLI
-# -------------------------------------------------------------------
-read -p "Installer ArgoCD CLI? (y/n) " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo -e "${YELLOW}Vérification d'ArgoCD CLI...${NC}"
-    if ! command -v argocd &> /dev/null; then
-        echo -e "${YELLOW}Installation d'ArgoCD CLI...${NC}"
-        curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 || {
-            echo -e "${RED}Échec du téléchargement d'ArgoCD CLI${NC}"
-            exit 1
-        }
-        sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
-        rm argocd-linux-amd64
-        
-        # Vérification de l'installation
-        argocd version --client --short && echo -e "${GREEN}ArgoCD CLI installé avec succès${NC}" || {
-            echo -e "${RED}Échec de l'installation d'ArgoCD CLI${NC}"
-            exit 1
-        }
-    else
-        echo -e "${GREEN}ArgoCD CLI est déjà installé${NC}"
+        log_info "ArgoCD CLI non installé (vous pouvez l'installer plus tard)"
     fi
 fi
 
-# -------------------------------------------------------------------
-# Résumé de l'installation
-# -------------------------------------------------------------------
-echo -e "${GREEN}\nInstallation terminée. Résumé :${NC}"
-echo "----------------------------------------"
-echo -n "Docker:          " && docker --version 2>/dev/null || echo "Non installé"
-echo -n "Docker Compose:  " && docker-compose --version 2>/dev/null || echo "Non installé"
-echo -n "kubectl:         " && kubectl version --client --short 2>/dev/null || echo "Non installé"
-echo -n "Minikube:        " && minikube version 2>/dev/null || echo "Non installé"
-echo -n "Helm:            " && helm version --short 2>/dev/null || echo "Non installé"
-echo -n "Git:             " && git --version 2>/dev/null || echo "Non installé"
+# =============================================================================
+# Résumé
+# =============================================================================
+log_step "Résumé de l'installation"
 
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo -n "ArgoCD:          " && argocd version --client --short 2>/dev/null || echo "Non installé"
+echo ""
+echo "  Outil            Version"
+echo "  ───────────────  ────────────────────────────────────"
+printf "  %-17s %s\n" "Docker"          "$(docker --version 2>/dev/null || echo 'Non installé')"
+printf "  %-17s %s\n" "Docker Compose"  "$(docker compose version --short 2>/dev/null || docker-compose --version 2>/dev/null || echo 'Non installé')"
+printf "  %-17s %s\n" "kubectl"         "$(kubectl version --client -o yaml 2>/dev/null | grep gitVersion | awk '{print $2}' || echo 'Non installé')"
+printf "  %-17s %s\n" "Minikube"        "$(minikube version --short 2>/dev/null || echo 'Non installé')"
+printf "  %-17s %s\n" "Helm"            "$(helm version --short 2>/dev/null || echo 'Non installé')"
+printf "  %-17s %s\n" "Git"             "$(git --version 2>/dev/null || echo 'Non installé')"
+printf "  %-17s %s\n" "ArgoCD CLI"      "$(argocd version --client --short 2>/dev/null || echo 'Non installé')"
+echo "  ───────────────  ────────────────────────────────────"
+echo ""
+
+# Rappels importants
+echo -e "${YELLOW}━━━ ÉTAPES SUIVANTES ━━━${NC}"
+echo ""
+
+if [ "${NEED_RELOGIN:-false}" = true ]; then
+    echo -e "  ${RED}1. OBLIGATOIRE — Reconnectez-vous pour activer le groupe docker :${NC}"
+    echo "     Déconnexion/reconnexion OU exécutez : newgrp docker"
+    echo ""
 fi
 
-echo "----------------------------------------"
-echo -e "${YELLOW}Remarques importantes :${NC}"
-echo "1. Pour que les permissions Docker soient effectives, vous devez :"
-echo "   - Soit vous déconnecter et vous reconnecter"
-echo "   - Soit exécuter la commande : newgrp docker"
+echo "  2. Clonez votre fork du projet :"
+echo "     git clone https://github.com/VOTRE_USERNAME/devops-demo-project.git"
 echo ""
-echo "2. Si Minikube n'a pas pu démarrer (surtout si exécuté en root) :"
-echo "   - Exécutez en tant qu'utilisateur normal : minikube start --driver=docker"
-echo "   - Ou choisissez un autre driver : minikube start --driver=podman"
+echo "  3. Lancez l'environnement CI (Jenkins + SonarQube) :"
+echo "     cd devops-demo-project/ci"
+echo "     docker compose up -d"
 echo ""
-echo "3. Pour vérifier le cluster Minikube : kubectl get nodes"
+echo "     (Si 'docker compose' ne marche pas, essayez 'docker-compose up -d')"
 echo ""
-echo -e "${GREEN}Tous les outils ont été installés avec succès!${NC}"
+echo "  4. Quand vous passerez à la partie CD, démarrez Minikube :"
+echo "     minikube start --driver=docker --cpus 4 --memory 10240"
+echo ""
+echo -e "${GREEN}Installation terminée !${NC}"
