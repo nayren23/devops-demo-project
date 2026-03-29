@@ -1,6 +1,6 @@
 # Dockerfile
 
-FROM jenkins/jenkins:lts-jdk17
+FROM jenkins/jenkins:2.556
 
 # Switch to root to install Maven and Docker
 USER root
