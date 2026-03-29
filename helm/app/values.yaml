@@ -9,7 +9,7 @@ image:
   repository: nayren/demo-java-app
   pullPolicy: Always
   # Overrides the image tag whose default is the chart appVersion.
-  tag: V2.0
+  tag: V1.0
 
 appName: demo-java-app
 
