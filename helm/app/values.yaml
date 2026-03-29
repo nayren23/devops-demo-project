@@ -7,7 +7,7 @@ replicaCount: 2
 image:
   githubID: nayren23
   repository: nayren/demo-java-app
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
   # Overrides the image tag whose default is the chart appVersion.
   tag: V1.0
 
